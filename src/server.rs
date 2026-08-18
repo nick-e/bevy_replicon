@@ -4,6 +4,7 @@ pub(super) mod removal_buffer;
 pub mod replicated_archetypes;
 pub(super) mod replication_messages;
 mod replication_query;
+mod send_gate;
 pub mod server_tick;
 pub mod visibility;
 
@@ -132,6 +133,7 @@ impl Plugin for ServerPlugin {
         app.init_resource::<DespawnBuffer>()
             .init_resource::<RemovalBuffer>()
             .init_resource::<SerializedData>()
+            .init_resource::<send_gate::SendGate>()
             .init_resource::<ServerMessages>()
             .init_resource::<ServerTick>()
             .init_resource::<ServerChangeTick>()
@@ -280,7 +282,12 @@ fn check_protocol(
     }
 }
 
-fn check_mutation_ticks(check: On<CheckChangeTicks>, mut clients: Query<&mut ClientTicks>) {
+fn check_mutation_ticks(
+    check: On<CheckChangeTicks>,
+    mut clients: Query<&mut ClientTicks>,
+    mut send_gate: ResMut<send_gate::SendGate>,
+) {
+    send_gate.check_ticks(*check);
     debug!(
         "checking mutation ticks for overflow for {:?}",
         check.present_tick()
@@ -479,6 +486,7 @@ fn collect_despawns(
     registry: Res<FilterRegistry>,
     mut serialized: ResMut<SerializedData>,
     mut despawn_buffer: ResMut<DespawnBuffer>,
+    mut send_gate: ResMut<send_gate::SendGate>,
     mut clients: Query<(
         Entity,
         &mut Updates,
@@ -488,6 +496,11 @@ fn collect_despawns(
     )>,
 ) -> Result<()> {
     for entity in despawn_buffer.drain(..) {
+        // The gate keys its records by entity, and an id is reused after the
+        // entity is despawned, so a record left here would be read as the new
+        // entity's previous value.
+        send_gate.remove_entity(entity);
+
         let entity_range = serialized.write_entity(entity)?;
         for (client, mut message, mut ticks, mut priority, mut visibility) in &mut clients {
             let hidden_lifetime = visibility.get(entity).hidden_entity_lifetime(&registry);
@@ -684,6 +697,7 @@ fn collect_changes(
     mut replicated_archetypes: ResMut<ReplicatedArchetypes>,
     mut serialized: ResMut<SerializedData>,
     mut removal_buffer: ResMut<RemovalBuffer>,
+    mut send_gate: ResMut<send_gate::SendGate>,
     mut clients: Query<(
         Entity,
         &mut Updates,
@@ -734,6 +748,29 @@ fn collect_changes(
                 };
 
                 let mut component_range = None;
+
+                // The tick the component's value last differed on, which
+                // replaces Bevy's write tick in the mutation gate below. A
+                // write that stores the value already there advances the write
+                // tick, so gating on it sends a value every client already has.
+                // `Once` rules never reach that gate, so they skip the
+                // comparison and the serialization it needs.
+                let value_change_tick = if rule.mode == ReplicationMode::Once {
+                    ticks.changed
+                } else {
+                    let range = serialized.write_cached_component(
+                        &mut ctx,
+                        &mut component_range,
+                        &mut component,
+                    )?;
+                    send_gate.last_change(
+                        entity.id(),
+                        rule.fns_id,
+                        ticks.changed,
+                        &serialized[range],
+                    )
+                };
+
                 for (client, mut updates, mut mutations, client_ticks, priority_map, visibility) in
                     &mut clients
                 {
@@ -760,7 +797,8 @@ fn collect_changes(
                         if hidden_lifetime.is_none()
                             && rule.mode != ReplicationMode::Once
                             && base_priority * tick_diff as f32 >= 1.0
-                            && ticks.is_changed(entity_ticks.system_tick, **change_tick)
+                            && value_change_tick
+                                .is_newer_than(entity_ticks.system_tick, **change_tick)
                         {
                             trace!(
                                 "writing `{:?}` mutation for `{}` for client `{client}`",
